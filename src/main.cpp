@@ -19,12 +19,20 @@
 #include <utility>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <fstream>
 #include <string> 
 #include <nlohmann/json.hpp>
 
 using namespace SVF;
 using json = nlohmann::json;
+
+typedef struct PointersPlus {
+    const llvm::Value *value;
+    unsigned line;
+    BasicBlock *block;
+    std::pair<unsigned, unsigned> *unsafe;
+} PointersPlus;
 
 std::vector<PointsTo> getPointsToSets(Andersen *ander, Module &modu, const std::vector<const llvm::Value*> pointers) {
     std::vector<PointsTo> pointsToSets;
@@ -38,19 +46,22 @@ std::vector<PointsTo> getPointsToSets(Andersen *ander, Module &modu, const std::
     return pointsToSets;
 }
 
-std::unordered_map<const llvm::Value*, std::vector<const llvm::Value*>> reverseMapPointsToSets(
+std::unordered_map<const llvm::Value*, std::vector<PointersPlus>> reverseMapPointsToSets(
     Andersen *ander,
     Module &modu,
     const std::vector<PointsTo>& pointsToSets,
-    const std::vector<const llvm::Value*>& pointers
+    const std::vector<PointersPlus> &pointers_lines
     ) {
 
-    //TODO map { Value : Vec<Value> }
-    std::unordered_map<const llvm::Value*, std::vector<const llvm::Value*>> reverseMap;
+    std::unordered_map<const llvm::Value*, std::vector<PointersPlus>> reverseMap;
+    std::unordered_set<const llvm::Value *> original_pointers_set;
+    for (auto ptline : pointers_lines) {
+        original_pointers_set.emplace(ptline.value);
+    }
 
     for (size_t i = 0; i < pointsToSets.size(); ++i) {
         const PointsTo& pts = pointsToSets[i];
-        const llvm::Value* pointer = pointers[i];
+        PointersPlus pt_line = pointers_lines[i];
 
         for (NodeID nodeId : pts) {
             PAGNode* targetObj = ander->getPAG()->getGNode(nodeId);
@@ -58,13 +69,17 @@ std::unordered_map<const llvm::Value*, std::vector<const llvm::Value*>> reverseM
             if (targetObj->hasValue()) {
                 // Assuming a direct mapping is possible, convert SVF::SVFValue to llvm::Value*
                 const llvm::Value *llvmValue = LLVMModuleSet::getLLVMModuleSet()->getLLVMValue(targetObj->getValue());
-                //TODO do an insert into a vec or something
+                if (llvmValue->getName().str() == ""
+                    // || original_pointers_set.find(llvmValue) != original_pointers_set.end()
+                    ) {
+                    break;
+                }
                 if (reverseMap.find(llvmValue) == reverseMap.end()) {
                     // If not, add a new entry with a vector containing the current pointer
-                    reverseMap[llvmValue] = {pointer};
+                    reverseMap[llvmValue] = {pt_line};
                 } else {
                     // If yes, append the current pointer to the existing vector
-                    reverseMap[llvmValue].push_back(pointer);
+                    reverseMap[llvmValue].push_back(pt_line);
                 }
             }
         }
@@ -101,7 +116,9 @@ void collectValues(llvm::Instruction *inst, const llvm::Value *val, std::vector<
     }
 }
 
-std::unordered_map<const llvm::Value*, std::vector<const llvm::Value*>> runPointerAnalysis(Module &modu, std::vector<const llvm::Value *> pointers) {
+std::unordered_map<const llvm::Value*, std::vector<PointersPlus>> runPointerAnalysis(
+    Module &modu,
+    std::vector<PointersPlus> pointers_lines) {
     SVFModule* svfModule = LLVMModuleSet::getLLVMModuleSet()->buildSVFModule(modu);
 
     /// Build Program Assignment Graph (SVFIR)
@@ -111,8 +128,12 @@ std::unordered_map<const llvm::Value*, std::vector<const llvm::Value*>> runPoint
     /// Create Andersen's pointer analysis
     Andersen* ander = AndersenWaveDiff::createAndersenWaveDiff(pag);
 
-    std::vector<PointsTo> PointToSets = getPointsToSets(ander, modu, pointers);
-    std::unordered_map<const llvm::Value*, std::vector<const llvm::Value*>> reverseMapping = reverseMapPointsToSets(ander, modu, PointToSets, pointers);
+    std::vector<const llvm::Value *> pointers;
+    for (auto x : pointers_lines) {
+        pointers.push_back(x.value);
+    }
+    std::vector<PointsTo> pointToSets = getPointsToSets(ander, modu, pointers);
+    std::unordered_map<const llvm::Value*, std::vector<PointersPlus>> reverseMapping = reverseMapPointsToSets(ander, modu, pointToSets, pointers_lines);
 
     // Cleanup
     AndersenWaveDiff::releaseAndersenWaveDiff();
@@ -129,13 +150,14 @@ int main(int argc, char *argv[]) {
     llvm::SMDiagnostic smDiag;
     llvm::raw_os_ostream debugOut(std::cout);
 
-    assert(argc >= 4);
+    assert(argc >= 2);
+    std::string locationspath{argv[2]};
+    std::string irpath{argv[1]};
     
     // Load the LLVM IR file.
     std::unique_ptr<llvm::Module> modu = parseIRFile(argv[1], smDiag, context);
     
-    //FIXME un-hardcode this shit
-    std::ifstream locationsFile("../io/locations.txt");
+    std::ifstream locationsFile(locationspath);
     if (!locationsFile.is_open()) {
         std::cerr << "Error: Unable to open locations.txt" << std::endl;
         return 1;
@@ -143,52 +165,46 @@ int main(int argc, char *argv[]) {
 
     std::string line;
     // [(filename, (unsafe_start, unsafe_end))]
-    std::vector<std::pair<std::string, std::vector<std::pair<int, int>>> > locations;
+    std::vector<std::pair<std::string, std::vector<std::pair<unsigned, unsigned>>> > locations;
 
-    //FIXME we never get more than the first filename
+    std::string filename = "";
+    std::vector<std::pair<unsigned, unsigned>> range;
     while (std::getline(locationsFile, line)) {
-        std::string filename = line;
-        std::vector<std::pair<int, int>> range;
-        while (std::getline(locationsFile, line) && !line.empty()) {
-            int start, end;
-            if (sscanf(line.c_str(), "(%d,%d)", &start, &end) == 2) {
-                range.push_back(std::make_pair(start, end));
-            }
+        int start, end;
+        if (sscanf(line.c_str(), "(%u,%u)", &start, &end) == 2) {
+            if (filename == "") {break;} // we have some issue
+            range.push_back(std::make_pair(start, end));
         }
-
+        else {
+            if (filename != "") {
+                locations.push_back(std::make_pair(filename, range));
+                range = {};
+            }
+            filename = line;
+        }
+    }
+    if (filename != "") {
         locations.push_back(std::make_pair(filename, range));
     }
 
     // Close the locations file
     locationsFile.close();
 
+    // [{filename : [{ alloc: line, pointers: [{name : _, line : _}]}]}]
+    json output = json::array();
+
     //DEBUG stuff
-    for (auto location : locations) {
-        std::cout << location.first << std::endl;
-        for (auto range : location.second) {
-            std::cout << range.first << " " << range.second << std::endl;
-        }
-    }
-    std::cout << "Going into main loop" << std::endl;
+    // for (auto location : locations) {
+    //     std::cout << location.first << std::endl;
+    //     for (auto range : location.second) {
+    //         std::cout << range.first << " " << range.second << std::endl;
+    //     }
+    // }
+    // std::cout << "Going into main loop" << std::endl;
 
     for (int i = 0; i < locations.size(); i++) {
         const std::string& filename = locations[i].first;
-        const std::vector<std::pair<int, int>>& ranges = locations[i].second;
-
-        //FIXME this doesn't make sense????? You need do a find() or something instead of equals.
-        // Issue here is that you're only considering the i'th range, but we need to consider all ranges for this location!!
-        int unsafe_start = ranges[i].first;
-        int unsafe_end = ranges[i].second;
-
-        //DEBUG stuff
-        std::cout << unsafe_start << " " << unsafe_end << std::endl;
-        continue;
-
-        //sscanf(locations[1].c_str(), "(%d,%d)", &unsafe_start, &unsafe_end) == 2;
-
-
-        //int unsafe_start = atoi(argv[2]);
-        //int unsafe_end = atoi(argv[3]);
+        std::vector<std::pair<unsigned, unsigned>>& ranges = locations[i].second;
 
         if (!modu) {
             // Handle any parsing errors here.
@@ -196,8 +212,8 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        std::unordered_map<const llvm::Value*, std::vector<const llvm::Value*>> reverseMapping;
-        std::vector<const llvm::Value *> pointers;
+        std::unordered_map<const llvm::Value*, std::vector<PointersPlus>> reverseMapping;
+        std::vector<PointersPlus> pointers_lines;
 
         // STEP 1: Iterate through all instructions and find unsafe pointers
         for (Function& func : *modu) {
@@ -218,11 +234,18 @@ int main(int argc, char *argv[]) {
                                 if (auto *dbgLoc = llvm::dyn_cast<llvm::DILocation>(metadata)) {
                                     unsigned line = dbgLoc->getLine();
                                     // Compare the instruction's position to the unsafe blocks
-                                    //TODO are there cases where there isn't metadata, but we know current basic block is inside unsafe?
-                                    if (line >= unsafe_start && line <= unsafe_end) {
-                                        // instruction.print(debugOut);
-                                        // std::cout << std::endl;
-                                        collectPointerValues(&instruction, pointers);
+                                    for (std::pair<unsigned, unsigned> &range : ranges) {
+                                        int unsafe_start = range.first;
+                                        int unsafe_end = range.second;
+                                        if (line >= unsafe_start && line <= unsafe_end) {
+                                            // instruction.print(debugOut);
+                                            // std::cout << std::endl;
+                                            std::vector<const llvm::Value *> pointers;
+                                            collectPointerValues(&instruction, pointers);
+                                            for (auto ptr : pointers) {
+                                                pointers_lines.push_back({ptr, line, &block, &range});
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -233,26 +256,26 @@ int main(int argc, char *argv[]) {
         }
 
         // STEP 2: for each unsafe pointer, run pointer analysis
-        reverseMapping = runPointerAnalysis(*modu, pointers);
+        reverseMapping = runPointerAnalysis(*modu, pointers_lines);
+        json alloc_arr = json::array();
 
-        // [{filename : { alloc : [{name : _, line : _}]}}]
         // STEP 3: find the location of the allocations that have unsafe pointers to them
         for (const auto& mapping : reverseMapping) {
-            const llvm::Value* llvmValue = mapping.first; // allocation results from analysis
-            std::cout << "Results' value: " << llvmValue->getName().str() << std::endl;
-            bool allocaflag = false; // flag set up if we encountered an alloca on current llvmValue
+            const llvm::Value* allocsite = mapping.first; // allocation results from analysis
+            std::cout << "Results' value: " << allocsite->getName().str() << std::endl;
             for (Function& func : *modu) {
                 for (BasicBlock& block : func) {
+                    bool allocaflag = false; // flag set up if we encountered an alloca on current allocsite
                     for (Instruction& instruction : block) {
                         // Get pointers from an instruction
                         std::vector<const llvm::Value *> values;
                         // Value * equality implies Value equality
-                        collectValues(&instruction, llvmValue, values);
+                        collectValues(&instruction, allocsite, values);
                         for (const llvm::Value *v : values) {
                             // std::cout << "HURRAY" << std::endl;
                             // Check if this is a variable declaration/definition
-                            if (llvm::isa<llvm::AllocaInst>(&instruction) || llvm::isa<llvm::GlobalVariable>(llvmValue)) {
-                                // We found an alloca for current llvmValue, but does it have debug info???
+                            if (llvm::isa<llvm::AllocaInst>(&instruction) || llvm::isa<llvm::GlobalVariable>(allocsite)) {
+                                // We found an alloca for current allocsite, but does it have debug info???
                                 // Set flag up by default
                                 allocaflag = true;
                             }
@@ -264,10 +287,28 @@ int main(int argc, char *argv[]) {
                                     for (auto& mdpair : smallvec) {
                                         llvm::MDNode* metadata = mdpair.second;
                                         if (auto* dbgLoc = llvm::dyn_cast<llvm::DILocation>(metadata)) {
+                                            // We found the allocsite's line!
                                             // Set flag down since we found the line for alloca
                                             allocaflag = false;
                                             unsigned line = dbgLoc->getLine();
-                                            std::cout << "Variable: " << llvmValue->getName().str() << " defined at line " << line << std::endl;
+                                            // Construct json unsafe pointers array
+                                            std::unordered_set<json> pointers_set;
+                                            for (auto pt_line : mapping.second) {
+                                                std::cout << "Pointer: " << allocsite->getName().str() << " defined at line " << line << std::endl;
+                                                // Ignore pointers from the same block AND ignore this allocsite if it's in the same unsafe region
+                                                if (pt_line.block == &block
+                                                    || (line >= pt_line.unsafe->first && line <= pt_line.unsafe->second)) {
+                                                    continue;
+                                                }
+                                                if (allocsite->getName().str() == pt_line.value->getName().str() && line == pt_line.line) {
+                                                    std::cout << "Pointer: " << allocsite->getName().str() << " defined at line " << line << " ptr value " << pt_line.value << " cur val " << v << " ptr block " << pt_line.block << " cur block " << &block << std::endl;
+                                                }
+                                                json pt_obj = {{"name", pt_line.value->getName().str()}, {"line", pt_line.line}};
+                                                pointers_set.emplace(pt_obj);
+                                            }
+                                            if (pointers_set.size() == 0) { continue; }
+                                            json pointers(pointers_set);
+                                            alloc_arr.push_back({{"allocvar", allocsite->getName().str()}, {"allocline", line}, {"pointers", pointers}});
                                         }
                                     }
                                 }
@@ -277,7 +318,12 @@ int main(int argc, char *argv[]) {
                 }
             }
         }
+        output.push_back({{"filename", filename}, {"results", alloc_arr}});
     }
+    std::ofstream outfile;
+    outfile.open("results.json");
+    outfile << output << std::endl;
+    outfile.close();
 
     // Cleanup
     llvm::llvm_shutdown();
