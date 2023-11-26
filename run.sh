@@ -12,7 +12,7 @@ code_root="."
 if [ -d src ]; then
     code_root="src"
 fi
-python3 ~/search/x.py $code_root > locations.txt
+python3 $scriptpath/tools/search.py $code_root > locations.txt
 [ $? -ne 0 ] && exit 1
 locationsfile=$(realpath locations.txt)
 cd $scriptdir

@@ -1,0 +1,3 @@
+[submodule "tools/tree-sitter-rust"]
+	path = tools/tree-sitter-rust
+	url = https://github.com/tree-sitter/tree-sitter-rust.git
