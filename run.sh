@@ -17,5 +17,5 @@ python3 ~/search/x.py $code_root > locations.txt
 locationsfile=$(realpath locations.txt)
 cd $scriptdir
 make && \
-    bin/parser $irfile $locationsfile && \
+    time bin/parser $irfile $locationsfile && \
     cp results.json $root/results.json
