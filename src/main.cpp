@@ -137,57 +137,6 @@ bool isAllocation(llvm::Instruction *inst, const llvm::Value *val) {
     return false;
 }
 
-std::vector<PointersPlus> traverseOnVFG(const VFG* vfg, const Value* allocval, std::vector<PointersPlus> &potentialPointers)
-{
-    SVFIR* pag = SVFIR::getPAG();
-    SVFValue* svfval = LLVMModuleSet::getLLVMModuleSet()->getSVFValue(allocval);
-
-    const PAGNode* pNode = pag->getGNode(pag->getValueNode(svfval));
-    const VFGNode* vNode = vfg->getDefVFGNode(pNode);
-    FIFOWorkList<const VFGNode*> worklist;
-    Set<const VFGNode*> visited;
-    worklist.push(vNode);
-
-    /// Traverse along VFG
-    while (!worklist.empty())
-    {
-        const VFGNode* vNode = worklist.pop();
-        for (VFGNode::const_iterator it = vNode->OutEdgeBegin(), eit =
-                    vNode->OutEdgeEnd(); it != eit; ++it)
-        {
-            VFGEdge* edge = *it;
-            VFGNode* succNode = edge->getDstNode();
-            if (visited.find(succNode) == visited.end())
-            {
-                visited.insert(succNode);
-                worklist.push(succNode);
-            }
-        }
-    }
-
-    std::vector<PointersPlus> ret;
-
-    /// Collect all LLVM Values
-    for(Set<const VFGNode*>::const_iterator it = visited.begin(), eit = visited.end(); it!=eit; ++it)
-    {
-        const VFGNode* node = *it;
-        /// can only query VFGNode involving top-level pointers (starting with % or @ in LLVM IR)
-        // const PAGNode* pNode = vfg->getLHSTopLevPtr(node);
-        // const Value* val = LLVMModuleSet::getLLVMModuleSet()->getLLVMValue(pNode->getValue());
-        const SVFValue *svfval = node->getValue();
-        if (svfval == nullptr) { continue; }
-        const Value *val = LLVMModuleSet::getLLVMModuleSet()->getLLVMValue(svfval);
-        for (auto pp : potentialPointers) {
-            if (val == pp.value) {
-                // std::cout << "VFG worked?? " << val->getName().str() << std::endl;
-                ret.push_back(pp);
-            }
-        }
-    }
-    return ret;
-}
-
-
 std::vector<PointersPlus> traverseOnSVFG(const SVFG* vfg, const Value* allocval, std::vector<PointersPlus> &potentialPointers)
 {
     SVFIR* pag = SVFIR::getPAG();
@@ -259,58 +208,23 @@ std::unordered_map<const llvm::Value*, std::vector<PointersPlus>> runPointerAnal
     std::vector<PointsTo> pointToSets = getPointsToSets(pa, modu, pointers);
     std::unordered_map<const llvm::Value*, std::vector<PointersPlus>> reverseMapping = reverseMapPointsToSets(pa, modu, pointToSets, pointers_lines);
 
-    // SVFGBuilder svfBuilder;
-    // SVFG* svfg = svfBuilder.buildFullSVFG(ander);
+    // Initialize value-flow analysis
+    SVFGBuilder svfBuilder;
+    SVFG* svfg = svfBuilder.buildFullSVFG(ander);
 
     // PTACallGraph* callgraph = ander->getPTACallGraph();
     // VFG *vfg = new VFG(callgraph);
 
+    // For each allocsite, verify that all pointers in mapping can be reached via value-flow analysis
     std::unordered_map<const llvm::Value*, std::vector<PointersPlus>> ret;
-    // for (auto &pair : reverseMapping) {
-    //     // std::vector<PointersPlus> pps = traverseOnVFG(vfg, pair.first, pair.second);
-    //     std::vector<PointersPlus> pps = traverseOnSVFG(svfg, pair.first, pair.second);
-    //     if (pps.size() > 0) {
-    //         ret[pair.first] = pps;
-    //     }
-    // }
+    for (auto &pair : reverseMapping) {
+        // std::vector<PointersPlus> pps = traverseOnVFG(vfg, pair.first, pair.second);
+        std::vector<PointersPlus> pps = traverseOnSVFG(svfg, pair.first, pair.second);
+        if (pps.size() > 0) {
+            ret[pair.first] = pps;
+        }
+    }
     ret = reverseMapping;
-
-    //TODO do additional value flow analysis to increase precision
-    // If there exists a pointer in pointer_values that allocation_values cannot reach,
-    //    remove that pointer from pointer_values
-    // If allocation doesn't reach ANY of pointers in pointer_values, remove allocation_value
-    //    from the mapping entirely
-    // for (auto it = reverseMapping.begin(); it != reverseMapping.end();) {
-    //     const llvm::Value* allocation_value = it->first;
-    //     bool found = false;
-
-    // for (auto& [allocationValue, pointersPlusVec] : reverseMapping) {
-    //     for (auto it = pointersPlusVec.begin(); it != pointersPlusVec.end();) {
-    //         const PointersPlus& ptrPlus = *it;
-    //         const llvm::Value* pointer = ptrPlus.value;
-            
-
-    //         //const CallSiteToFunPtrMap& SVF_allocate = pa->getIndirectCallsites();
-
-
-    //         // Conduct value flow analysis using SVF functionalities
-
-    //         // SVFFunction(pointer, allocationValue);
-    //         // Replace the above line with relevant SVF functionalities to determine value flow
-    //         // Remove pointers or allocation_values accordingly based on the analysis
-
-    //         // if (valueFlowAnalysisFunction(pointer, allocationValue)) {
-    //         //     it = pointersPlusVec.erase(it); // Remove the pointer if not reached by allocation_values
-    //         // } else {
-    //         //     ++it;
-    //         // }
-    //     }
-
-    //     // Remove allocationValue if it doesn't reach ANY pointers in pointer_values
-    //     if (pointersPlusVec.empty()) {
-    //         reverseMapping.erase(allocationValue);
-    //     }
-    // }
 
     // Cleanup
     // delete vfg;
@@ -371,17 +285,7 @@ int main(int argc, char *argv[]) {
     // Close the locations file
     locationsFile.close();
 
-    // [{filename : [{ alloc: line, pointers: [{name : _, line : _}]}]}]
     json output = json::array();
-
-    //DEBUG stuff
-    // for (auto location : locations) {
-    //     std::cout << location.first << std::endl;
-    //     for (auto range : location.second) {
-    //         std::cout << range.first << " " << range.second << std::endl;
-    //     }
-    // }
-    // std::cout << "Going into main loop" << std::endl;
 
     if (!modu) {
         // Handle any parsing errors here.
@@ -426,11 +330,6 @@ int main(int argc, char *argv[]) {
                                                 for (auto ptr : pointers) {
                                                     pointers_lines.push_back({ptr, line, &block, &range, dbgfilename});
                                                 }
-                                                // if (pointers.size() > 0) {
-                                                //     instruction.print(debugOut);
-                                                //     std::cout << std::endl;
-                                                //     std::cout << dbgfilename << ":" << line << std::endl;
-                                                // }
                                             }
                                         }
                                     }
@@ -443,15 +342,8 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    //DEBUG
-    // for (auto pt : pointers_lines) {
-    //     std::cout << "Line: " << pt.line << " Range start: " << pt.unsafe->first << " File: " << filename << std::endl;
-    // }
-
     // STEP 2: for each unsafe pointer, run pointer analysis
     reverseMapping = runPointerAnalysis(*modu, pointers_lines);
-
-    // json alloc_arr = json::array();
 
     // STEP 3: find the location of the allocations that have unsafe pointers to them
     for (const auto& mapping : reverseMapping) {
@@ -465,19 +357,6 @@ int main(int argc, char *argv[]) {
             for (BasicBlock& block : func) {
                 bool allocaflag = false; // flag set up if we encountered an alloca on current allocsite
                 for (Instruction& instruction : block) {
-                    // Get pointers from an instruction
-                    // std::vector<const llvm::Value *> values;
-                    // Value * equality implies Value equality
-                    // collectValues(&instruction, allocsite, values);
-                    // for (const llvm::Value *v : values) {
-                        // std::cout << "HURRAY" << std::endl;
-                        // Check if this is a variable declaration/definition
-                        // if (llvm::isa<llvm::AllocaInst>(&instruction) || llvm::isa<llvm::GlobalVariable>(allocsite)) {
-                        //     // We found an alloca for current allocsite, but does it have debug info???
-                        //     // Set flag up by default
-                        //     allocaflag = true;
-                        //     std::cout << "Found alloca" << std::endl;
-                        // }
                     if (!allocaflag) {
                         allocaflag = isAllocation(&instruction, allocsite);
                         // if (allocaflag) { std::cout << "found something allocated" << std::endl; }
